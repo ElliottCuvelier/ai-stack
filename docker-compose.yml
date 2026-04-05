@@ -30,13 +30,15 @@ networks:
     external: true
 
 volumes:
-  ollama-gpu-data:
-    driver: local
   hermes-personal-data:
     driver: local
   # hermes-cto-data:
   #   driver: local
   mission-control-data:
+    driver: local
+  redis-data:
+    driver: local
+  postgres-data:
     driver: local
 
 services:
@@ -90,6 +92,9 @@ services:
     environment:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_PERSONAL}
+      - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY}
+      - FIRECRAWL_API_URL=http://firecrawl-api:3002
+      - HONCHO_API_KEY=${HONCHO_SECRET_KEY}
     depends_on:
       - ollama-gpu
     command: gateway run
@@ -124,9 +129,184 @@ services:
   #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
   #     - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
   #     - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_CTO}
+  #     - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY}
+  #     - FIRECRAWL_API_URL=http://firecrawl-api:3002
+  #     - HONCHO_API_KEY=${HONCHO_SECRET_KEY}
   #   depends_on:
   #     - ollama-gpu
   #   command: gateway run
+
+  # ---------------------------------------------------------------------------
+  # REDIS — Job Queue (Firecrawl dependency)
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    restart: unless-stopped
+    networks:
+      - ai-core
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # POSTGRES — Relational DB (Honcho dependency)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres
+    restart: unless-stopped
+    networks:
+      - ai-core
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-ai_stack}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ---------------------------------------------------------------------------
+  # CAMOFOX — Hermes Browser Service (Stealth Firefox)
+  # ---------------------------------------------------------------------------
+  # Managed browser sessions for Hermes agents. Enables web browsing,
+  # form interaction, and persistent sessions with cookie support.
+  #
+  # API:  http://<host>:9377
+  # Docs: https://github.com/jo-inc/camofox-browser
+  #
+  # After boot, set in ~/.hermes/config.yaml:
+  #   browser:
+  #     camofox:
+  #       managed_persistence: true
+  # ---------------------------------------------------------------------------
+  camofox:
+    build:
+      context: https://github.com/jo-inc/camofox-browser.git
+    container_name: camofox
+    restart: unless-stopped
+    networks:
+      - ai-core
+    ports:
+      - "9377:9377"
+    shm_size: "1gb"
+    environment:
+      - CAMOFOX_PORT=9377
+      - CAMOFOX_API_KEY=${CAMOFOX_API_KEY}
+      - CAMOFOX_ADMIN_KEY=${CAMOFOX_ADMIN_KEY}
+      - MAX_SESSIONS=${CAMOFOX_MAX_SESSIONS:-10}
+      - SESSION_TIMEOUT_MS=1800000
+      - BROWSER_IDLE_TIMEOUT_MS=300000
+
+  # ---------------------------------------------------------------------------
+  # RABBITMQ — Message Queue (Firecrawl dependency)
+  # ---------------------------------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    restart: unless-stopped
+    networks:
+      - ai-core
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # FIRECRAWL — Web Scraping & Crawling API
+  # ---------------------------------------------------------------------------
+  # Turns any URL into LLM-ready markdown. Used by Hermes agents for
+  # research, summarisation, and web-grounded answers.
+  #
+  # API:  http://<host>:3002/v1
+  # Auth: Set FIRECRAWL_API_KEY in .env
+  #
+  # playwright-service handles JS-heavy page rendering for the crawler.
+  # USE_DB_AUTHENTICATION=false skips the nuq-postgres requirement.
+  # ---------------------------------------------------------------------------
+  firecrawl-playwright:
+    image: ghcr.io/firecrawl/playwright-service:latest
+    container_name: firecrawl-playwright
+    restart: unless-stopped
+    networks:
+      - ai-core
+    environment:
+      - PORT=3000
+      - PROXY_SERVER=${PROXY_SERVER:-}
+      - PROXY_USERNAME=${PROXY_USERNAME:-}
+      - PROXY_PASSWORD=${PROXY_PASSWORD:-}
+      - BLOCK_MEDIA=${FIRECRAWL_BLOCK_MEDIA:-true}
+      - MAX_CONCURRENT_PAGES=${FIRECRAWL_CONCURRENT_REQUESTS:-10}
+    tmpfs:
+      - /tmp/.cache:noexec,nosuid,size=1g
+
+  firecrawl-api:
+    image: ghcr.io/firecrawl/firecrawl:latest
+    container_name: firecrawl-api
+    restart: unless-stopped
+    networks:
+      - ai-core
+    ports:
+      - "${FIRECRAWL_PORT:-3002}:3002"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=3002
+      - REDIS_URL=redis://redis:6379
+      - REDIS_RATE_LIMIT_URL=redis://redis:6379
+      - PLAYWRIGHT_MICROSERVICE_URL=http://firecrawl-playwright:3000/scrape
+      - NUQ_RABBITMQ_URL=amqp://rabbitmq:5672
+      - USE_DB_AUTHENTICATION=false
+      - NUM_WORKERS_PER_QUEUE=${FIRECRAWL_NUM_WORKERS:-8}
+      - CRAWL_CONCURRENT_REQUESTS=${FIRECRAWL_CONCURRENT_REQUESTS:-10}
+      - MAX_CONCURRENT_JOBS=${FIRECRAWL_MAX_JOBS:-5}
+      - BULL_AUTH_KEY=${FIRECRAWL_API_KEY}
+      - TEST_API_KEY=${FIRECRAWL_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OLLAMA_BASE_URL=http://ollama-gpu:11434
+    depends_on:
+      redis:
+        condition: service_healthy
+      firecrawl-playwright:
+        condition: service_started
+      rabbitmq:
+        condition: service_healthy
+    command: node dist/src/harness.js --start-docker
+
+  # ---------------------------------------------------------------------------
+  # HONCHO — User & Session Memory for AI Agents
+  # ---------------------------------------------------------------------------
+  # Persistent memory layer for Hermes agents. Tracks user context, goals,
+  # and conversation history across sessions.
+  #
+  # API:  http://<host>:8000
+  # Docs: https://docs.honcho.dev
+  # ---------------------------------------------------------------------------
+  honcho:
+    image: ghcr.io/plastic-labs/honcho:latest
+    container_name: honcho
+    restart: unless-stopped
+    networks:
+      - ai-core
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ai_stack}
+      - SECRET_KEY=${HONCHO_SECRET_KEY}
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # ---------------------------------------------------------------------------
   # MISSION CONTROL — Web Dashboard (OPTIONAL)
