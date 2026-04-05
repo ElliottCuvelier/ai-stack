@@ -232,7 +232,7 @@ services:
   # Auth: Set FIRECRAWL_API_KEY in .env
   #
   # playwright-service handles JS-heavy page rendering for the crawler.
-  # USE_DB_AUTHENTICATION=false skips the nuq-postgres requirement.
+  # USE_DB_AUTHENTICATION=false — no external Postgres needed for Firecrawl.
   # ---------------------------------------------------------------------------
   firecrawl-playwright:
     image: ghcr.io/firecrawl/playwright-service:latest
@@ -280,7 +280,7 @@ services:
         condition: service_started
       rabbitmq:
         condition: service_healthy
-    command: node dist/src/harness.js --start-docker
+    command: node dist/src/harness.js
 
   # ---------------------------------------------------------------------------
   # HONCHO — User & Session Memory for AI Agents
@@ -302,6 +302,10 @@ services:
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ai_stack}
       - SECRET_KEY=${HONCHO_SECRET_KEY}
+      - LLM_TYPE=openai
+      - OPENAI_API_KEY=ollama
+      - OPENAI_BASE_URL=http://ollama-gpu:11434/v1
+      - OPENAI_MODEL=${HONCHO_MODEL:-qwen3:8b}
     depends_on:
       postgres:
         condition: service_healthy
