@@ -42,7 +42,6 @@ volumes:
     driver: local
 
 services:
-
   # ---------------------------------------------------------------------------
   # OLLAMA — Shared Local GPU Model (RTX 2070 Super, 8GB VRAM)
   # ---------------------------------------------------------------------------
@@ -191,8 +190,7 @@ services:
   #       managed_persistence: true
   # ---------------------------------------------------------------------------
   camofox:
-    build:
-      context: https://github.com/jo-inc/camofox-browser.git
+    image: camofox:local
     container_name: camofox
     restart: unless-stopped
     networks:
