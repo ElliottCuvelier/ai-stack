@@ -34,8 +34,8 @@ volumes:
     driver: local
   hermes-personal-data:
     driver: local
-  hermes-cto-data:
-    driver: local
+  # hermes-cto-data:
+  #   driver: local
   mission-control-data:
     driver: local
 
@@ -88,7 +88,6 @@ services:
       - hermes-personal-data:/opt/data
       - /var/run/docker.sock:/var/run/docker.sock:ro
     environment:
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_PERSONAL}
     depends_on:
