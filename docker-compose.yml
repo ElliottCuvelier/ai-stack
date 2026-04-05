@@ -280,7 +280,7 @@ services:
         condition: service_started
       rabbitmq:
         condition: service_healthy
-    command: node dist/src/harness.js
+    command: node dist/src/harness.js --start-built
 
   # ---------------------------------------------------------------------------
   # HONCHO — User & Session Memory for AI Agents
@@ -302,10 +302,9 @@ services:
     environment:
       - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ai_stack}
       - SECRET_KEY=${HONCHO_SECRET_KEY}
-      - LLM_TYPE=openai
-      - OPENAI_API_KEY=ollama
-      - OPENAI_BASE_URL=http://ollama-gpu:11434/v1
-      - OPENAI_MODEL=${HONCHO_MODEL:-qwen3:8b}
+      - SUMMARY_PROVIDER=openai_compatible
+      - LLM_OPENAI_COMPATIBLE_API_KEY=ollama
+      - LLM_OPENAI_COMPATIBLE_BASE_URL=http://ollama-gpu:11434/v1
     depends_on:
       postgres:
         condition: service_healthy
