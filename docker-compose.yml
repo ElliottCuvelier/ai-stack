@@ -1,0 +1,154 @@
+# =============================================================================
+# AI Stack — Multi-Agent Hermes Architecture
+# =============================================================================
+#
+#   You ──Telegram (@AssistantBot)──► Hermes: Personal Assistant
+#   You ──Telegram (@CTOBot)────────► Hermes: CTO / Technical Expert
+#                                       │
+#              ┌────────────────────────┘
+#              ▼
+#   ┌─ Anthropic API ─── primary reasoning
+#   ├─ OpenRouter ─────── sub-tasks, cheap fallback
+#   └─ Ollama GPU ─────── heartbeats, offline, privacy
+#
+#   Mission Control (optional) ─── cost dashboard
+#
+# ADDING MORE AGENTS:
+#   1. Copy the hermes-cto service block
+#   2. Change: container_name, volume name, TELEGRAM_BOT_TOKEN var
+#   3. Create a new Telegram bot via @BotFather
+#   4. Add the new volume to the volumes section
+#   5. docker compose up -d
+#   6. docker exec -it <new-container> hermes setup
+#
+# NETWORK: Uses external "ai-core" network.
+#   Create first:  docker network create ai-core
+# =============================================================================
+
+networks:
+  ai-core:
+    external: true
+
+volumes:
+  ollama-gpu-data:
+    driver: local
+  hermes-personal-data:
+    driver: local
+  hermes-cto-data:
+    driver: local
+  mission-control-data:
+    driver: local
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # OLLAMA — Shared Local GPU Model (RTX 2070 Super, 8GB VRAM)
+  # ---------------------------------------------------------------------------
+  # Shared by all Hermes agents. Qwen 3 8B for heartbeats and offline.
+  # After first boot:  docker exec ollama-gpu ollama pull qwen3:8b
+  # ---------------------------------------------------------------------------
+  ollama-gpu:
+    image: ollama/ollama:latest
+    container_name: ollama-gpu
+    restart: unless-stopped
+    networks:
+      - ai-core
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-gpu-data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+      - OLLAMA_NUM_GPU=999
+      - OLLAMA_KEEP_ALIVE=30m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # ---------------------------------------------------------------------------
+  # HERMES — Personal Assistant
+  # ---------------------------------------------------------------------------
+  # Your daily driver. Calendar, reminders, personal tasks, general chat.
+  # Learns your preferences, routines, and communication style over time.
+  #
+  # First-time:  docker exec -it hermes-personal hermes setup
+  # Telegram:    Create bot via @BotFather → token in .env
+  # ---------------------------------------------------------------------------
+  hermes-personal:
+    image: nousresearch/hermes-agent:latest
+    container_name: hermes-personal
+    restart: unless-stopped
+    networks:
+      - ai-core
+    volumes:
+      - hermes-personal-data:/opt/data
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_PERSONAL}
+    depends_on:
+      - ollama-gpu
+    command: gateway run
+
+  # ---------------------------------------------------------------------------
+  # HERMES — CTO / Technical Expert
+  # ---------------------------------------------------------------------------
+  # Architecture decisions, code review, system design, technical research.
+  # Builds its own skill library around your tech stack over time.
+  #
+  # This agent has completely isolated memory and skills from the personal
+  # assistant. It will develop deep expertise in your codebase, infra
+  # patterns, and engineering preferences independently.
+  #
+  # First-time:  docker exec -it hermes-cto hermes setup
+  # Telegram:    Create a SEPARATE bot via @BotFather → token in .env
+  #
+  # TIP: During setup, you can configure a different primary model.
+  #   Personal assistant → Claude Sonnet (fast, cheap for daily chat)
+  #   CTO agent → Claude Opus (deeper reasoning for architecture decisions)
+  # ---------------------------------------------------------------------------
+  # hermes-cto:
+  #   image: nousresearch/hermes-agent:latest
+  #   container_name: hermes-cto
+  #   restart: unless-stopped
+  #   networks:
+  #     - ai-core
+  #   volumes:
+  #     - hermes-cto-data:/opt/data
+  #     - /var/run/docker.sock:/var/run/docker.sock:ro
+  #   environment:
+  #     - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+  #     - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+  #     - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_CTO}
+  #   depends_on:
+  #     - ollama-gpu
+  #   command: gateway run
+
+  # ---------------------------------------------------------------------------
+  # MISSION CONTROL — Web Dashboard (OPTIONAL)
+  # ---------------------------------------------------------------------------
+  # Start with:  docker compose --profile dashboard up -d
+  # Access:      http://<unraid-ip>:3000/setup
+  # ---------------------------------------------------------------------------
+  mission-control:
+    image: ghcr.io/builderz-labs/mission-control:latest
+    container_name: mission-control
+    restart: unless-stopped
+    networks:
+      - ai-core
+    ports:
+      - "3000:3000"
+    volumes:
+      - mission-control-data:/app/.data
+    environment:
+      - AUTH_USER=${MC_AUTH_USER:-admin}
+      - AUTH_PASS=${MC_AUTH_PASS}
+      - API_KEY=${MC_API_KEY}
+      - NEXT_PUBLIC_GATEWAY_OPTIONAL=true
+    profiles:
+      - dashboard
