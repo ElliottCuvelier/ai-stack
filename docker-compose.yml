@@ -96,7 +96,7 @@ services:
       - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY}
       - FIRECRAWL_API_URL=http://firecrawl-api:3002
       - HONCHO_BASE_URL=http://honcho:8000
-      - HONCHO_API_KEY=${HONCHO_SECRET_KEY}
+      # - HONCHO_API_KEY=${HONCHO_SECRET_KEY}
     depends_on:
       ollama-gpu:
         condition: service_started
@@ -361,8 +361,8 @@ services:
       - "8000:8000"
     environment:
       - DB_CONNECTION_URI=postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ai_stack}
-      - AUTH_JWT_SECRET=${HONCHO_SECRET_KEY}
-      - AUTH_USE_AUTH=true
+      # - AUTH_JWT_SECRET=${HONCHO_SECRET_KEY}
+      - AUTH_USE_AUTH=false
       # OpenRouter — OpenAI-compatible client (provider "custom" in Honcho)
       - LLM_OPENAI_COMPATIBLE_API_KEY=${OPENROUTER_API_KEY}
       - LLM_OPENAI_COMPATIBLE_BASE_URL=https://openrouter.ai/api/v1
