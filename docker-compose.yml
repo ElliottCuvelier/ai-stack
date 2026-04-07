@@ -341,7 +341,12 @@ services:
   #   Summarization  → vLLM client → Ollama at /v1 (GPU, matches stack default model)
   #   Summary backup → OpenRouter (custom)
   #   Deriver / dialectic / dream → OpenRouter (custom), tiered models
-  #   Embeddings     → OpenAI (OpenRouter has no embeddings API)
+  #   Embeddings     → OpenAI SDK → OPENAI_BASE_URL (default: Ollama /v1).
+  #     Honcho requests model id "text-embedding-3-small"; create an Ollama
+  #     tag with that name from nomic-embed-text, e.g. after pull:
+  #       printf 'FROM nomic-embed-text\n' | docker exec -i ollama-gpu ollama create text-embedding-3-small -
+  #     Switch to cloud OpenAI: set HONCHO_OPENAI_BASE_URL=https://api.openai.com/v1,
+  #     HONCHO_VECTOR_STORE_DIMENSIONS=1536, and a real key (see .env.example).
   #
   # API:  http://<host>:8000
   # Docs: https://docs.honcho.dev
@@ -401,8 +406,10 @@ services:
       - DREAM_MODEL=${HONCHO_DREAM_MODEL:-anthropic/claude-3.5-sonnet}
       - DREAM_DEDUCTION_MODEL=${HONCHO_DREAM_DEDUCTION_MODEL:-google/gemini-2.0-flash-lite}
       - DREAM_INDUCTION_MODEL=${HONCHO_DREAM_INDUCTION_MODEL:-google/gemini-2.0-flash-lite}
-      # Embeddings — direct OpenAI key (OpenRouter has no embeddings endpoint)
-      - LLM_OPENAI_API_KEY=${OPENAI_API_KEY}
+      # Embeddings — OpenAI-compatible API (default Ollama); see header comment
+      - OPENAI_BASE_URL=${HONCHO_OPENAI_BASE_URL:-http://ollama-gpu:11434/v1}
+      - LLM_OPENAI_API_KEY=${HONCHO_OPENAI_API_KEY:-${OPENAI_API_KEY:-ollama}}
+      - VECTOR_STORE_DIMENSIONS=${HONCHO_VECTOR_STORE_DIMENSIONS:-768}
       - EMBED_MESSAGES=true
       - LLM_EMBEDDING_PROVIDER=openai
     healthcheck:
