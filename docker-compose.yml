@@ -40,6 +40,8 @@ volumes:
     driver: local
   postgres-data:
     driver: local
+  firecrawl-nuq-data:
+    driver: local
 
 services:
   # ---------------------------------------------------------------------------
@@ -93,9 +95,13 @@ services:
       - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_PERSONAL}
       - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY}
       - FIRECRAWL_API_URL=http://firecrawl-api:3002
+      - HONCHO_BASE_URL=http://honcho:8000
       - HONCHO_API_KEY=${HONCHO_SECRET_KEY}
     depends_on:
-      - ollama-gpu
+      ollama-gpu:
+        condition: service_started
+      honcho:
+        condition: service_healthy
     command: gateway run
 
   # ---------------------------------------------------------------------------
@@ -130,9 +136,13 @@ services:
   #     - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN_CTO}
   #     - FIRECRAWL_API_KEY=${FIRECRAWL_API_KEY}
   #     - FIRECRAWL_API_URL=http://firecrawl-api:3002
+  #     - HONCHO_BASE_URL=http://honcho:8000
   #     - HONCHO_API_KEY=${HONCHO_SECRET_KEY}
   #   depends_on:
-  #     - ollama-gpu
+  #     ollama-gpu:
+  #       condition: service_started
+  #     honcho:
+  #       condition: service_healthy
   #   command: gateway run
 
   # ---------------------------------------------------------------------------
@@ -146,7 +156,7 @@ services:
       - ai-core
     volumes:
       - redis-data:/data
-    command: redis-server --appendonly yes
+    command: redis-server --bind 0.0.0.0 --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -154,16 +164,20 @@ services:
       retries: 5
 
   # ---------------------------------------------------------------------------
-  # POSTGRES — Relational DB (Honcho dependency)
+  # POSTGRES — Honcho (pgvector + pg_trgm required by Honcho)
+  # ---------------------------------------------------------------------------
+  # init script runs only on first data volume init; if you migrated from
+  # plain postgres:16-alpine, exec in and: CREATE EXTENSION vector; CREATE EXTENSION pg_trgm;
   # ---------------------------------------------------------------------------
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg16
     container_name: postgres
     restart: unless-stopped
     networks:
       - ai-core
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init-honcho-extensions.sql:/docker-entrypoint-initdb.d/01-honcho-extensions.sql:ro
     environment:
       - POSTGRES_USER=${POSTGRES_USER:-postgres}
       - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -223,6 +237,31 @@ services:
       start_period: 20s
 
   # ---------------------------------------------------------------------------
+  # FIRECRAWL NUQ — Postgres for Firecrawl job queue (NUQ)
+  # ---------------------------------------------------------------------------
+  # Harness detects compose mode when POSTGRES_HOST != localhost and points
+  # NUQ at this DB. Do not reuse Honcho’s database.
+  # ---------------------------------------------------------------------------
+  firecrawl-nuq-postgres:
+    image: ghcr.io/firecrawl/nuq-postgres:latest
+    container_name: firecrawl-nuq-postgres
+    restart: unless-stopped
+    networks:
+      - ai-core
+    volumes:
+      - firecrawl-nuq-data:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_USER=${FIRECRAWL_NUQ_USER:-firecrawl}
+      - POSTGRES_PASSWORD=${FIRECRAWL_NUQ_PASSWORD}
+      - POSTGRES_DB=${FIRECRAWL_NUQ_DB:-firecrawl}
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$$POSTGRES_USER" -d "$$POSTGRES_DB"']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
   # FIRECRAWL — Web Scraping & Crawling API
   # ---------------------------------------------------------------------------
   # Turns any URL into LLM-ready markdown. Used by Hermes agents for
@@ -232,7 +271,8 @@ services:
   # Auth: Set FIRECRAWL_API_KEY in .env
   #
   # playwright-service handles JS-heavy page rendering for the crawler.
-  # USE_DB_AUTHENTICATION=false — no external Postgres needed for Firecrawl.
+  # NUQ Postgres (firecrawl-nuq-postgres) is required for the queue workers.
+  # USE_DB_AUTHENTICATION=false — no Supabase; NUQ still uses Postgres above.
   # ---------------------------------------------------------------------------
   firecrawl-playwright:
     image: ghcr.io/firecrawl/playwright-service:latest
@@ -265,6 +305,11 @@ services:
       - REDIS_RATE_LIMIT_URL=redis://redis:6379
       - PLAYWRIGHT_MICROSERVICE_URL=http://firecrawl-playwright:3000/scrape
       - NUQ_RABBITMQ_URL=amqp://rabbitmq:5672
+      - POSTGRES_HOST=firecrawl-nuq-postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${FIRECRAWL_NUQ_USER:-firecrawl}
+      - POSTGRES_PASSWORD=${FIRECRAWL_NUQ_PASSWORD}
+      - POSTGRES_DB=${FIRECRAWL_NUQ_DB:-firecrawl}
       - USE_DB_AUTHENTICATION=false
       - NUM_WORKERS_PER_QUEUE=${FIRECRAWL_NUM_WORKERS:-8}
       - CRAWL_CONCURRENT_REQUESTS=${FIRECRAWL_CONCURRENT_REQUESTS:-10}
@@ -272,7 +317,9 @@ services:
       - BULL_AUTH_KEY=${FIRECRAWL_API_KEY}
       - TEST_API_KEY=${FIRECRAWL_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
-      - OLLAMA_BASE_URL=http://ollama-gpu:11434
+      - OLLAMA_BASE_URL=http://ollama-gpu:11434/api
+      - MODEL_NAME=${FIRECRAWL_OLLAMA_MODEL:-qwen3:8b}
+      - MODEL_EMBEDDING_NAME=${FIRECRAWL_OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
     depends_on:
       redis:
         condition: service_healthy
@@ -280,13 +327,21 @@ services:
         condition: service_started
       rabbitmq:
         condition: service_healthy
-    command: node dist/src/harness.js --start-built
+      firecrawl-nuq-postgres:
+        condition: service_healthy
+    command: node dist/src/harness.js --start-docker
 
   # ---------------------------------------------------------------------------
   # HONCHO — User & Session Memory for AI Agents
   # ---------------------------------------------------------------------------
   # Persistent memory layer for Hermes agents. Tracks user context, goals,
   # and conversation history across sessions.
+  #
+  # LLM routing (Honcho v3 SupportedProviders: custom = OpenAI-compatible):
+  #   Summarization  → vLLM client → Ollama at /v1 (GPU, matches stack default model)
+  #   Summary backup → OpenRouter (custom)
+  #   Deriver / dialectic / dream → OpenRouter (custom), tiered models
+  #   Embeddings     → OpenAI (OpenRouter has no embeddings API)
   #
   # API:  http://<host>:8000
   # Docs: https://docs.honcho.dev
@@ -300,12 +355,65 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ai_stack}
-      - SECRET_KEY=${HONCHO_SECRET_KEY}
-      - SUMMARY_PROVIDER=openai_compatible
-      - LLM_OPENAI_COMPATIBLE_API_KEY=ollama
-      - LLM_OPENAI_COMPATIBLE_BASE_URL=http://ollama-gpu:11434/v1
+      - DB_CONNECTION_URI=postgresql+psycopg://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-ai_stack}
+      - AUTH_JWT_SECRET=${HONCHO_SECRET_KEY}
+      - AUTH_USE_AUTH=false
+      # OpenRouter — OpenAI-compatible client (provider "custom" in Honcho)
+      - LLM_OPENAI_COMPATIBLE_API_KEY=${OPENROUTER_API_KEY}
+      - LLM_OPENAI_COMPATIBLE_BASE_URL=https://openrouter.ai/api/v1
+      # Ollama — separate vLLM client (OpenAI-compatible API at /v1)
+      - LLM_VLLM_BASE_URL=http://ollama-gpu:11434/v1
+      - LLM_VLLM_API_KEY=ollama
+      # Summarization — local GPU via Ollama; backup via OpenRouter
+      - SUMMARY_PROVIDER=vllm
+      - SUMMARY_MODEL=${HONCHO_SUMMARY_OLLAMA_MODEL:-qwen3:8b}
+      - SUMMARY_BACKUP_PROVIDER=custom
+      - SUMMARY_BACKUP_MODEL=${HONCHO_SUMMARY_BACKUP_MODEL:-google/gemini-2.0-flash-lite}
+      # Deriver (background) — fast OpenRouter model
+      - DERIVER_PROVIDER=custom
+      - DERIVER_MODEL=${HONCHO_DERIVER_MODEL:-google/gemini-2.0-flash-lite}
+      # Dialectic — tiered OpenRouter models per reasoning level
+      - DIALECTIC_LEVELS__minimal__PROVIDER=custom
+      - DIALECTIC_LEVELS__minimal__MODEL=${HONCHO_DIALECTIC_MINIMAL_MODEL:-google/gemini-2.0-flash-lite}
+      - DIALECTIC_LEVELS__minimal__THINKING_BUDGET_TOKENS=0
+      - DIALECTIC_LEVELS__minimal__MAX_TOOL_ITERATIONS=1
+      - DIALECTIC_LEVELS__minimal__MAX_OUTPUT_TOKENS=250
+      - DIALECTIC_LEVELS__minimal__TOOL_CHOICE=any
+      - DIALECTIC_LEVELS__low__PROVIDER=custom
+      - DIALECTIC_LEVELS__low__MODEL=${HONCHO_DIALECTIC_LOW_MODEL:-google/gemini-2.0-flash-lite}
+      - DIALECTIC_LEVELS__low__THINKING_BUDGET_TOKENS=0
+      - DIALECTIC_LEVELS__low__MAX_TOOL_ITERATIONS=5
+      - DIALECTIC_LEVELS__low__TOOL_CHOICE=any
+      - DIALECTIC_LEVELS__medium__PROVIDER=custom
+      - DIALECTIC_LEVELS__medium__MODEL=${HONCHO_DIALECTIC_MEDIUM_MODEL:-openai/gpt-4o-mini}
+      - DIALECTIC_LEVELS__medium__THINKING_BUDGET_TOKENS=0
+      - DIALECTIC_LEVELS__medium__MAX_TOOL_ITERATIONS=2
+      - DIALECTIC_LEVELS__high__PROVIDER=custom
+      - DIALECTIC_LEVELS__high__MODEL=${HONCHO_DIALECTIC_HIGH_MODEL:-anthropic/claude-3.5-sonnet}
+      - DIALECTIC_LEVELS__high__THINKING_BUDGET_TOKENS=0
+      - DIALECTIC_LEVELS__high__MAX_TOOL_ITERATIONS=4
+      - DIALECTIC_LEVELS__max__PROVIDER=custom
+      - DIALECTIC_LEVELS__max__MODEL=${HONCHO_DIALECTIC_MAX_MODEL:-anthropic/claude-3.5-sonnet}
+      - DIALECTIC_LEVELS__max__THINKING_BUDGET_TOKENS=0
+      - DIALECTIC_LEVELS__max__MAX_TOOL_ITERATIONS=10
+      # Dream — OpenRouter (would default to Anthropic without these)
+      - DREAM_PROVIDER=custom
+      - DREAM_MODEL=${HONCHO_DREAM_MODEL:-anthropic/claude-3.5-sonnet}
+      - DREAM_DEDUCTION_MODEL=${HONCHO_DREAM_DEDUCTION_MODEL:-google/gemini-2.0-flash-lite}
+      - DREAM_INDUCTION_MODEL=${HONCHO_DREAM_INDUCTION_MODEL:-google/gemini-2.0-flash-lite}
+      # Embeddings — direct OpenAI key (OpenRouter has no embeddings endpoint)
+      - LLM_OPENAI_API_KEY=${OPENAI_API_KEY}
+      - EMBED_MESSAGES=true
+      - LLM_EMBEDDING_PROVIDER=openai
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
     depends_on:
+      ollama-gpu:
+        condition: service_started
       postgres:
         condition: service_healthy
 
